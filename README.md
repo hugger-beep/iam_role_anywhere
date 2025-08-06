@@ -1,5 +1,17 @@
 # IAM Roles Anywhere Cross-Account Setup Guide
 
+## Document Updates
+
+**Last Updated**: December 2024  
+**Version**: 2.0  
+**Changes**:
+- Added comprehensive OpenSSL-based setup section
+- Included Windows step-by-step instructions
+- Enhanced engineer notes throughout
+- Fixed S3 bucket naming security issues
+- Added certificate lifecycle management
+- Completed troubleshooting sections
+
 ## Overview
 This guide covers setting up IAM Roles Anywhere where:
 - **Account A**: Contains ACM Private CA (Certificate Authority)
@@ -570,3 +582,873 @@ echo "Certificate renewed successfully"
 - Certificate issuance events
 
 This comprehensive guide provides all necessary steps for setting up IAM Roles Anywhere in a cross-account scenario with ACM Private CA.
+
+
+### Using OpenSSL as anchor  For IAM Role anywhere
+
+## Overview
+This section covers setting up IAM Roles Anywhere using OpenSSL-generated certificates as the trust anchor, with an application running in Account B that needs AWS access.
+
+### Engineer Notes
+**Use Case**: When you don't have ACM Private CA but need certificate-based authentication
+**Cost Benefit**: No PCA cost
+**Security**: You control the entire certificate lifecycle
+**Limitation**: Manual certificate management and validation
+
+## Architecture for OpenSSL Setup
+
+```mermaid
+graph TB
+    subgraph "Local Environment"
+        OPENSSL["🔧 OpenSSL CA"]
+        ROOTCA["📜 Root CA Certificate"]
+        CLIENTKEY["🔐 Client Private Key"]
+        CLIENTCERT["📄 Client Certificate"]
+    end
+    
+    subgraph "Account B - Application Account"
+        APP["💻 Application"]
+        TA["🎯 Trust Anchor"]
+        PROFILE["👤 Profile"]
+        ROLE["🔑 IAM Role"]
+    end
+    
+    OPENSSL --> ROOTCA
+    OPENSSL --> CLIENTKEY
+    OPENSSL --> CLIENTCERT
+    ROOTCA --> TA
+    CLIENTCERT --> APP
+    CLIENTKEY --> APP
+    TA --> PROFILE
+    PROFILE --> ROLE
+    
+    style OPENSSL fill:#ffcc99
+    style APP fill:#99ff99
+    style TA fill:#99ccff
+    style ROLE fill:#ff9999
+```
+
+## Step 1: Create Root CA with OpenSSL
+
+### Engineer Notes
+**Where to Run**: Local machine or secure CA server (NOT in AWS)
+**Security**: Root CA private key is most critical - store securely
+**Purpose**: Creates the certificate authority that will sign client certificates
+**File Management**: Keep CA files separate from client certificates
+
+**Run on**: Your local workstation or dedicated CA server
+
+### 1.1 Create CA Directory Structure
+```bash
+# Create CA directory structure
+mkdir -p ca/{certs,crl,newcerts,private}
+cd ca
+echo 1000 > serial
+touch index.txt
+```
+
+### 1.2 Create CA Configuration
+```bash
+# Create CA configuration file
+cat > openssl.cnf << 'EOF'
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir               = .
+certs             = $dir/certs
+crl_dir           = $dir/crl
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial
+RANDFILE          = $dir/private/.rand
+
+private_key       = $dir/private/ca.key
+certificate       = $dir/certs/ca.crt
+
+crlnumber         = $dir/crlnumber
+crl               = $dir/crl/ca.crl
+crl_extensions    = crl_ext
+default_crl_days  = 30
+
+default_md        = sha256
+name_opt          = ca_default
+cert_opt          = ca_default
+default_days      = 365
+preserve          = no
+policy            = policy_strict
+
+[ policy_strict ]
+countryName             = match
+stateOrProvinceName     = match
+organizationName        = match
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ req ]
+default_bits        = 2048
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+x509_extensions     = v3_ca
+
+[ req_distinguished_name ]
+countryName                     = Country Name (2 letter code)
+stateOrProvinceName             = State or Province Name
+localityName                    = Locality Name
+0.organizationName              = Organization Name
+organizationalUnitName          = Organizational Unit Name
+commonName                      = Common Name
+emailAddress                    = Email Address
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[ client_cert ]
+basicConstraints = CA:FALSE
+nsCertType = client, email
+nsComment = "OpenSSL Generated Client Certificate"
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth, emailProtection
+EOF
+```
+
+### 1.3 Generate Root CA
+```bash
+# Generate CA private key
+openssl genrsa -aes256 -out private/ca.key 4096
+
+# Generate CA certificate
+openssl req -config openssl.cnf \
+    -key private/ca.key \
+    -new -x509 -days 7300 -sha256 -extensions v3_ca \
+    -out certs/ca.crt \
+    -subj "/C=US/ST=State/L=City/O=MyCompany/OU=IT/CN=MyCompany Root CA"
+```
+
+### Engineer Notes
+**Password Protection**: CA key is encrypted - remember the passphrase!
+**Validity Period**: 7300 days = ~20 years for root CA
+**Subject Fields**: Customize C/ST/L/O/OU/CN for your organization
+**Key Size**: 4096-bit for root CA provides long-term security
+
+## Step 2: Create Client Certificate
+
+### Engineer Notes
+**Purpose**: Generate certificate that your application will use for authentication
+**CN Importance**: Must match IAM role trust policy condition
+**Key Management**: Client private key stays with your application
+**Certificate Signing**: Signed by your root CA
+
+**Run on**: Same machine as Step 1 (where CA files are located)
+
+### 2.1 Generate Client Private Key
+```bash
+# Generate client private key (no password for application use)
+openssl genrsa -out private/client.key 2048
+```
+
+### 2.2 Create Client Certificate Request
+```bash
+# Generate client certificate signing request
+openssl req -config openssl.cnf \
+    -key private/client.key \
+    -new -sha256 -out client.csr \
+    -subj "/C=US/ST=State/L=City/O=MyCompany/OU=Applications/CN=app.mycompany.com"
+```
+
+### 2.3 Sign Client Certificate
+```bash
+# Sign the client certificate with CA
+openssl ca -config openssl.cnf \
+    -extensions client_cert -days 365 -notext -md sha256 \
+    -in client.csr \
+    -out certs/client.crt
+
+# Verify the certificate
+openssl verify -CAfile certs/ca.crt certs/client.crt
+```
+
+### Engineer Notes
+**Validity**: 365 days for client certificates (shorter than CA)
+**Extensions**: client_cert extensions enable clientAuth usage
+**Verification**: Should output "certs/client.crt: OK"
+**Files Created**: client.crt (certificate) and client.key (private key)
+
+## Step 3: Setup IAM Roles Anywhere in Account B
+
+### Engineer Notes
+**Account Context**: All commands run in Account B where your application resides
+**Prerequisites**: AWS CLI configured with admin permissions in Account B
+**Trust Anchor**: Uses your OpenSSL root CA certificate
+**Security**: Only certificates signed by your CA can authenticate
+
+**Run on**: Machine with AWS CLI access to Account B
+
+### 3.1 Create IAM Role for Application
+```bash
+# Create trust policy for IAM role
+cat > app-trust-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "rolesanywhere.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalTag/x509Subject/CN": "app.mycompany.com"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+# Create IAM role
+aws iam create-role \
+    --role-name ApplicationRolesAnywhereRole \
+    --assume-role-policy-document file://app-trust-policy.json \
+    --description "Role for application using IAM Roles Anywhere"
+```
+
+### 3.2 Attach Application Permissions
+```bash
+# Create application-specific policy
+cat > app-permissions.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::mycompany-prod-app-bucket-12345",
+                "arn:aws:s3:::mycompany-prod-app-bucket-12345/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue"
+            ],
+            "Resource": "arn:aws:secretsmanager:us-east-1:ACCOUNT-B:secret:app/*"
+        }
+    ]
+}
+EOF
+
+# Create and attach policy
+aws iam create-policy \
+    --policy-name ApplicationPermissions \
+    --policy-document file://app-permissions.json
+
+aws iam attach-role-policy \
+    --role-name ApplicationRolesAnywhereRole \
+    --policy-arn arn:aws:iam::ACCOUNT-B:policy/ApplicationPermissions
+```
+
+### Engineer Notes
+**CN Matching**: "app.mycompany.com" must match certificate CN exactly
+**Permissions**: Customize S3 bucket and Secrets Manager resources for your app
+**Least Privilege**: Only grant permissions your application actually needs
+**Policy ARN**: Replace ACCOUNT-B with your actual account ID
+
+### 3.3 Create Trust Anchor
+```bash
+# Upload your root CA certificate to create trust anchor
+aws rolesanywhere create-trust-anchor \
+    --name "OpenSSL-Root-CA" \
+    --source sourceType=CERTIFICATE_BUNDLE,sourceData=file://certs/ca.crt \
+    --enabled \
+    --region us-east-1
+```
+
+### 3.4 Create Profile
+```bash
+# Get role ARN
+ROLE_ARN=$(aws iam get-role --role-name ApplicationRolesAnywhereRole --query 'Role.Arn' --output text)
+
+# Create profile
+aws rolesanywhere create-profile \
+    --name "ApplicationProfile" \
+    --role-arns $ROLE_ARN \
+    --enabled \
+    --duration-seconds 3600 \
+    --region us-east-1
+```
+
+### Engineer Notes
+**Trust Anchor**: Links your OpenSSL CA to AWS IAM Roles Anywhere
+**Profile**: Connects trust anchor to specific IAM role
+**Duration**: 3600 seconds = 1 hour session duration
+**Region**: Must match where your application runs
+
+## Step 4: Deploy Application Configuration
+
+### Engineer Notes
+**Deployment Target**: Application server in Account B
+**File Transfer**: Securely copy certificate files to application server
+**Permissions**: Set appropriate file permissions for security
+**aws_signing_helper**: Install on application server
+
+**Run on**: Application server in Account B
+
+### 4.1 Install aws_signing_helper on Application Server
+```bash
+# Download aws_signing_helper
+curl -o aws_signing_helper https://rolesanywhere.amazonaws.com/releases/1.0.5/X86_64/Linux/aws_signing_helper
+chmod +x aws_signing_helper
+sudo mv aws_signing_helper /usr/local/bin/
+
+# Verify installation
+aws_signing_helper --version
+```
+
+### 4.2 Deploy Certificate Files
+```bash
+# Create certificate directory on application server
+sudo mkdir -p /opt/app/certs
+sudo chown app:app /opt/app/certs
+chmod 700 /opt/app/certs
+
+# Copy certificate files (use scp, ansible, or your deployment method)
+# From CA machine to application server:
+scp certs/client.crt app-server:/opt/app/certs/
+scp private/client.key app-server:/opt/app/certs/
+scp certs/ca.crt app-server:/opt/app/certs/
+
+# Set secure permissions
+chmod 600 /opt/app/certs/client.key
+chmod 644 /opt/app/certs/client.crt
+chmod 644 /opt/app/certs/ca.crt
+```
+
+### 4.3 Configure AWS CLI Profile for Application
+```bash
+# Get ARNs needed for configuration
+TRUST_ANCHOR_ARN=$(aws rolesanywhere list-trust-anchors --query 'trustAnchors[?name==`OpenSSL-Root-CA`].trustAnchorArn' --output text)
+PROFILE_ARN=$(aws rolesanywhere list-profiles --query 'profiles[?name==`ApplicationProfile`].profileArn' --output text)
+ROLE_ARN=$(aws iam get-role --role-name ApplicationRolesAnywhereRole --query 'Role.Arn' --output text)
+
+# Create AWS config for application
+sudo mkdir -p /opt/app/.aws
+cat > /opt/app/.aws/config << EOF
+[default]
+region = us-east-1
+
+[profile app-rolesanywhere]
+credential_process = aws_signing_helper credential-process \
+    --certificate /opt/app/certs/client.crt \
+    --private-key /opt/app/certs/client.key \
+    --trust-anchor-arn $TRUST_ANCHOR_ARN \
+    --profile-arn $PROFILE_ARN \
+    --role-arn $ROLE_ARN
+region = us-east-1
+EOF
+
+sudo chown -R app:app /opt/app/.aws
+```
+
+### Engineer Notes
+**File Ownership**: Ensure application user owns certificate files
+**Permissions**: 600 for private key, 644 for certificates
+**ARN Variables**: Script automatically gets required ARNs
+**Profile Name**: "app-rolesanywhere" - use in application code
+
+## Step 5: Test Application Authentication
+
+### Engineer Notes
+**Testing Strategy**: Test authentication before deploying application
+**Expected Behavior**: Should assume role and get temporary credentials
+**Troubleshooting**: Check certificate validity and ARN accuracy
+**Success Criteria**: get-caller-identity shows assumed role
+
+**Run on**: Application server
+
+### 5.1 Test AWS CLI Access
+```bash
+# Test authentication as application user
+sudo -u app bash
+export AWS_CONFIG_FILE=/opt/app/.aws/config
+
+# Test role assumption
+aws sts get-caller-identity --profile app-rolesanywhere
+
+# Test application permissions
+aws s3 ls s3://mycompany-prod-app-bucket-12345 --profile app-rolesanywhere
+aws secretsmanager get-secret-value --secret-id app/database --profile app-rolesanywhere
+```
+
+### 5.2 Verify Certificate Chain
+```bash
+# Verify certificate is valid
+openssl verify -CAfile /opt/app/certs/ca.crt /opt/app/certs/client.crt
+
+# Check certificate expiration
+openssl x509 -in /opt/app/certs/client.crt -noout -dates
+
+# Verify certificate details
+openssl x509 -in /opt/app/certs/client.crt -noout -subject -issuer
+```
+
+### Engineer Notes
+**Verification Output**: Should show "OK" for certificate validation
+**Expiration Check**: Monitor certificate expiration dates
+**Subject/Issuer**: Confirm CN matches IAM role trust policy
+**Chain Validation**: Ensures certificate was signed by your CA
+
+## Step 6: Application Integration
+
+### Engineer Notes
+**SDK Integration**: Most AWS SDKs support credential_process automatically
+**Environment Variables**: Set AWS_PROFILE to use the certificate-based profile
+**Error Handling**: Implement certificate expiration and renewal logic
+**Monitoring**: Log authentication events for security auditing
+
+### 6.1 Environment Configuration
+```bash
+# Create application environment file
+cat > /opt/app/.env << 'EOF'
+AWS_PROFILE=app-rolesanywhere
+AWS_CONFIG_FILE=/opt/app/.aws/config
+AWS_DEFAULT_REGION=us-east-1
+EOF
+
+# Set ownership
+sudo chown app:app /opt/app/.env
+```
+
+## Troubleshooting OpenSSL Setup
+
+### Common Issues and Solutions
+
+#### Certificate Validation Failures
+```bash
+# Check certificate chain
+openssl verify -verbose -CAfile /opt/app/certs/ca.crt /opt/app/certs/client.crt
+
+# Verify certificate details
+openssl x509 -in /opt/app/certs/client.crt -text -noout | grep -A5 "Subject:"
+
+# Check certificate dates
+openssl x509 -in /opt/app/certs/client.crt -noout -dates
+```
+
+#### IAM Roles Anywhere Authentication Issues
+```bash
+# Test credential helper directly
+aws_signing_helper credential-process \
+    --certificate /opt/app/certs/client.crt \
+    --private-key /opt/app/certs/client.key \
+    --trust-anchor-arn $TRUST_ANCHOR_ARN \
+    --profile-arn $PROFILE_ARN \
+    --role-arn $ROLE_ARN \
+    --debug
+
+# Check trust anchor status
+aws rolesanywhere get-trust-anchor --trust-anchor-id $TRUST_ANCHOR_ID
+
+# Verify profile configuration
+aws rolesanywhere get-profile --profile-id $PROFILE_ID
+```
+
+### Engineer Notes
+**Debug Process**: Start with certificate validation, then test IAM Roles Anywhere
+**Log Analysis**: Check application logs and AWS CloudTrail for authentication events
+**Permission Issues**: Verify IAM role permissions match application requirements
+**Network**: Ensure application server can reach AWS APIs
+
+### Windows step by step
+
+## Overview for Windows
+This section covers the same OpenSSL IAM Roles Anywhere setup but with Windows-specific commands and configurations.
+
+### Engineer Notes
+**Prerequisites**: Windows Server with OpenSSL, AWS CLI, and PowerShell
+**OpenSSL Installation**: Use Win64 OpenSSL from Shining Light Productions or Chocolatey
+**File Paths**: Windows uses backslashes and different directory structures
+**Permissions**: Use icacls instead of chmod for file permissions
+
+## Step 1: Install Prerequisites on Windows
+
+### Engineer Notes
+**Installation Order**: Install OpenSSL first, then AWS CLI
+**PowerShell**: Use PowerShell (not Command Prompt) for better scripting
+**Path Variables**: Ensure OpenSSL and AWS CLI are in system PATH
+**Administrator Rights**: Some commands require elevated PowerShell
+
+**Run on**: Windows machine (local or server)
+
+### 1.1 Install OpenSSL
+```powershell
+# Option 1: Using Chocolatey (recommended)
+choco install openssl
+
+# Option 2: Manual download from https://slproweb.com/products/Win32OpenSSL.html
+# Download Win64 OpenSSL v3.x.x Light
+# Install to C:\Program Files\OpenSSL-Win64
+
+# Verify installation
+openssl version
+```
+
+### 1.2 Install AWS CLI
+```powershell
+# Download and install AWS CLI v2 for Windows
+# From: https://awscli.amazonaws.com/AWSCLIV2.msi
+
+# Or using PowerShell
+Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "AWSCLIV2.msi"
+Start-Process msiexec.exe -Wait -ArgumentList '/I AWSCLIV2.msi /quiet'
+
+# Verify installation
+aws --version
+```
+
+## Step 2: Create Root CA with OpenSSL (Windows)
+
+### Engineer Notes
+**Working Directory**: Create dedicated folder for CA operations
+**File Paths**: Use forward slashes in OpenSSL config files even on Windows
+**Permissions**: Secure CA private key using Windows file permissions
+**Backup**: Store CA files on encrypted drive or secure location
+
+**Run on**: Windows CA machine
+
+### 2.1 Create CA Directory Structure
+```powershell
+# Create CA directory structure
+New-Item -ItemType Directory -Path "C:\CA" -Force
+Set-Location "C:\CA"
+New-Item -ItemType Directory -Path "certs", "crl", "newcerts", "private" -Force
+
+# Initialize CA database files
+Set-Content -Path "serial" -Value "1000"
+New-Item -ItemType File -Path "index.txt" -Force
+```
+
+### 2.2 Create CA Configuration File
+```powershell
+# Create OpenSSL configuration file
+@'
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir               = C:/CA
+certs             = $dir/certs
+crl_dir           = $dir/crl
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial
+RANDFILE          = $dir/private/.rand
+
+private_key       = $dir/private/ca.key
+certificate       = $dir/certs/ca.crt
+
+crlnumber         = $dir/crlnumber
+crl               = $dir/crl/ca.crl
+crl_extensions    = crl_ext
+default_crl_days  = 30
+
+default_md        = sha256
+name_opt          = ca_default
+cert_opt          = ca_default
+default_days      = 365
+preserve          = no
+policy            = policy_strict
+
+[ policy_strict ]
+countryName             = match
+stateOrProvinceName     = match
+organizationName        = match
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ req ]
+default_bits        = 2048
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+x509_extensions     = v3_ca
+
+[ req_distinguished_name ]
+countryName                     = Country Name (2 letter code)
+stateOrProvinceName             = State or Province Name
+localityName                    = Locality Name
+0.organizationName              = Organization Name
+organizationalUnitName          = Organizational Unit Name
+commonName                      = Common Name
+emailAddress                    = Email Address
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[ client_cert ]
+basicConstraints = CA:FALSE
+nsCertType = client, email
+nsComment = "OpenSSL Generated Client Certificate"
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth, emailProtection
+'@ | Out-File -FilePath "openssl.cnf" -Encoding UTF8
+```
+
+### 2.3 Generate Root CA
+```powershell
+# Generate CA private key
+openssl genrsa -aes256 -out private/ca.key 4096
+
+# Generate CA certificate
+openssl req -config openssl.cnf `
+    -key private/ca.key `
+    -new -x509 -days 7300 -sha256 -extensions v3_ca `
+    -out certs/ca.crt `
+    -subj "/C=US/ST=State/L=City/O=MyCompany/OU=IT/CN=MyCompany Root CA"
+
+# Secure CA private key (Windows equivalent of chmod 600)
+icacls "private\ca.key" /inheritance:d /grant:r "$env:USERNAME:(R)" /remove "Users" "Authenticated Users"
+```
+
+### Engineer Notes
+**PowerShell Backticks**: Use backticks (`) for line continuation in PowerShell
+**icacls Command**: Windows equivalent of chmod - restricts access to current user only
+**File Paths**: Use forward slashes in OpenSSL commands, backslashes in Windows commands
+**CA Key Security**: Store CA private key on encrypted drive or HSM in production
+
+## Step 3: Create Client Certificate (Windows)
+
+### Engineer Notes
+**Certificate Purpose**: For your Windows application authentication
+**CN Field**: Must match IAM role trust policy exactly
+**No Password**: Client key should not be password-protected for application use
+**File Location**: Store in application directory with proper permissions
+
+**Run on**: Same Windows CA machine
+
+### 3.1 Generate Client Private Key
+```powershell
+# Generate client private key (no password for application use)
+openssl genrsa -out private/client.key 2048
+
+# Secure client private key
+icacls "private\client.key" /inheritance:d /grant:r "$env:USERNAME:(R)" /remove "Users" "Authenticated Users"
+```
+
+### 3.2 Create Client Certificate Request
+```powershell
+# Generate client certificate signing request
+openssl req -config openssl.cnf `
+    -key private/client.key `
+    -new -sha256 -out client.csr `
+    -subj "/C=US/ST=State/L=City/O=MyCompany/OU=Applications/CN=app.mycompany.com"
+```
+
+### 3.3 Sign Client Certificate
+```powershell
+# Sign the client certificate with CA
+openssl ca -config openssl.cnf `
+    -extensions client_cert -days 365 -notext -md sha256 `
+    -in client.csr `
+    -out certs/client.crt
+
+# Verify the certificate
+openssl verify -CAfile certs/ca.crt certs/client.crt
+```
+
+## Step 4: Deploy to Windows Application Server
+
+### Engineer Notes
+**Target Server**: Windows server where your application runs
+**File Transfer**: Use RDP, PowerShell remoting, or secure file copy
+**Service Account**: Create dedicated service account for application
+**Directory Structure**: Use standard Windows application directories
+
+**Run on**: Windows application server
+
+### 4.1 Install aws_signing_helper on Windows Server
+```powershell
+# Download aws_signing_helper for Windows
+Invoke-WebRequest -Uri "https://rolesanywhere.amazonaws.com/releases/1.0.5/X86_64/Windows/aws_signing_helper.exe" -OutFile "aws_signing_helper.exe"
+
+# Move to system directory
+Move-Item "aws_signing_helper.exe" "C:\Windows\System32\aws_signing_helper.exe"
+
+# Verify installation
+aws_signing_helper --version
+```
+
+### 4.2 Create Application Directory Structure
+```powershell
+# Create application directories
+New-Item -ItemType Directory -Path "C:\MyApp", "C:\MyApp\certs", "C:\MyApp\config" -Force
+
+# Set directory permissions (restrict to application service account)
+$AppUser = "MyApp-Service"  # Replace with your service account
+icacls "C:\MyApp" /inheritance:d /grant:r "$AppUser:(OI)(CI)F" /grant:r "Administrators:(OI)(CI)F" /remove "Users" "Authenticated Users"
+icacls "C:\MyApp\certs" /inheritance:d /grant:r "$AppUser:(OI)(CI)R" /grant:r "Administrators:(OI)(CI)F" /remove "Users" "Authenticated Users"
+```
+
+### 4.3 Deploy Certificate Files
+```powershell
+# Copy certificate files to application server
+# From CA machine (use your preferred method: RDP, PowerShell remoting, etc.)
+Copy-Item "C:\CA\certs\client.crt" "C:\MyApp\certs\client.crt"
+Copy-Item "C:\CA\private\client.key" "C:\MyApp\certs\client.key"
+Copy-Item "C:\CA\certs\ca.crt" "C:\MyApp\certs\ca.crt"
+
+# Set secure permissions on certificate files
+icacls "C:\MyApp\certs\client.key" /inheritance:d /grant:r "$AppUser:(R)" /grant:r "Administrators:(F)" /remove "Users" "Authenticated Users"
+icacls "C:\MyApp\certs\client.crt" /inheritance:d /grant:r "$AppUser:(R)" /grant:r "Administrators:(F)" /remove "Users" "Authenticated Users"
+icacls "C:\MyApp\certs\ca.crt" /inheritance:d /grant:r "$AppUser:(R)" /grant:r "Administrators:(F)" /remove "Users" "Authenticated Users"
+```
+
+### 4.4 Configure AWS CLI Profile
+```powershell
+# Get ARNs from AWS (run with appropriate AWS credentials)
+$TrustAnchorArn = aws rolesanywhere list-trust-anchors --query 'trustAnchors[?name==`OpenSSL-Root-CA`].trustAnchorArn' --output text
+$ProfileArn = aws rolesanywhere list-profiles --query 'profiles[?name==`ApplicationProfile`].profileArn' --output text
+$RoleArn = aws iam get-role --role-name ApplicationRolesAnywhereRole --query 'Role.Arn' --output text
+
+# Create AWS config directory
+New-Item -ItemType Directory -Path "C:\MyApp\config\.aws" -Force
+
+# Create AWS config file
+@"
+[default]
+region = us-east-1
+
+[profile app-rolesanywhere]
+credential_process = aws_signing_helper credential-process --certificate C:/MyApp/certs/client.crt --private-key C:/MyApp/certs/client.key --trust-anchor-arn $TrustAnchorArn --profile-arn $ProfileArn --role-arn $RoleArn
+region = us-east-1
+"@ | Out-File -FilePath "C:\MyApp\config\.aws\config" -Encoding UTF8
+
+# Set permissions on config directory
+icacls "C:\MyApp\config\.aws" /inheritance:d /grant:r "$AppUser:(OI)(CI)R" /grant:r "Administrators:(OI)(CI)F" /remove "Users" "Authenticated Users"
+```
+
+### Engineer Notes
+**Forward Slashes**: Use forward slashes in AWS config file paths even on Windows
+**Service Account**: Replace "MyApp-Service" with your actual service account name
+**ARN Variables**: PowerShell variables store the ARNs for config file creation
+**File Encoding**: Use UTF8 encoding for AWS config files
+
+## Step 5: Test Windows Configuration
+
+### Engineer Notes
+**Testing Context**: Run tests as the application service account
+**Environment Variables**: Set AWS_CONFIG_FILE to point to your config
+**Expected Results**: Should see assumed role ARN in get-caller-identity
+**Troubleshooting**: Check Windows Event Logs for authentication errors
+
+**Run on**: Windows application server
+
+### 5.1 Test AWS CLI Access
+```powershell
+# Set environment variables
+$env:AWS_CONFIG_FILE = "C:\MyApp\config\.aws\config"
+
+# Test role assumption
+aws sts get-caller-identity --profile app-rolesanywhere
+
+# Test application permissions
+aws s3 ls s3://mycompany-prod-app-bucket-12345 --profile app-rolesanywhere
+aws secretsmanager get-secret-value --secret-id app/database --profile app-rolesanywhere
+```
+
+### 5.2 Verify Certificate Chain (Windows)
+```powershell
+# Verify certificate is valid
+openssl verify -CAfile "C:\MyApp\certs\ca.crt" "C:\MyApp\certs\client.crt"
+
+# Check certificate expiration
+openssl x509 -in "C:\MyApp\certs\client.crt" -noout -dates
+
+# Verify certificate details
+openssl x509 -in "C:\MyApp\certs\client.crt" -noout -subject -issuer
+```
+
+## Step 6: Windows Application Integration
+
+### Engineer Notes
+**Service Integration**: Configure as Windows Service for production
+**Environment Variables**: Set in service configuration or application config
+**Error Handling**: Implement Windows Event Log integration
+**Monitoring**: Use Windows Performance Counters and Event Logs
+
+### 6.1 Create Application Environment Configuration
+```powershell
+# Create application configuration file
+@"
+AWS_PROFILE=app-rolesanywhere
+AWS_CONFIG_FILE=C:\MyApp\config\.aws\config
+AWS_DEFAULT_REGION=us-east-1
+"@ | Out-File -FilePath "C:\MyApp\config\app.env" -Encoding UTF8
+
+# Set permissions
+icacls "C:\MyApp\config\app.env" /inheritance:d /grant:r "$AppUser:(R)" /grant:r "Administrators:(F)" /remove "Users" "Authenticated Users"
+```
+
+
+
+## Windows Troubleshooting
+
+### Engineer Notes
+**Debug Tools**: Use PowerShell, Windows Event Viewer, and Process Monitor
+**Common Issues**: File permissions, service account rights, certificate paths
+**Log Locations**: Windows Event Log (Application), AWS CLI logs in temp directory
+**Network**: Check Windows Firewall and proxy settings for AWS API access
+
+### Common Windows Issues
+
+#### Certificate Path Issues
+```powershell
+# Check if certificate files exist and are readable
+Test-Path "C:\MyApp\certs\client.crt"
+Test-Path "C:\MyApp\certs\client.key"
+Test-Path "C:\MyApp\certs\ca.crt"
+
+# Check file permissions
+icacls "C:\MyApp\certs\client.key"
+
+# Test certificate validation
+openssl verify -CAfile "C:\MyApp\certs\ca.crt" "C:\MyApp\certs\client.crt"
+```
+
+#### AWS CLI Configuration Issues
+```powershell
+# Test credential helper directly
+aws_signing_helper credential-process `
+    --certificate "C:/MyApp/certs/client.crt" `
+    --private-key "C:/MyApp/certs/client.key" `
+    --trust-anchor-arn $TrustAnchorArn `
+    --profile-arn $ProfileArn `
+    --role-arn $RoleArn `
+    --debug
+
+# Check AWS config file
+Get-Content "C:\MyApp\config\.aws\config"
+
+# Test with debug logging
+$env:AWS_DEBUG = "1"
+aws sts get-caller-identity --profile app-rolesanywhere
+``` 
