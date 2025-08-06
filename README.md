@@ -1,16 +1,5 @@
 # IAM Roles Anywhere Cross-Account Setup Guide
 
-## Document Updates
-
-**Last Updated**: December 2024  
-**Version**: 2.0  
-**Changes**:
-- Added comprehensive OpenSSL-based setup section
-- Included Windows step-by-step instructions
-- Enhanced engineer notes throughout
-- Fixed S3 bucket naming security issues
-- Added certificate lifecycle management
-- Completed troubleshooting sections
 
 ## Overview
 This guide covers setting up IAM Roles Anywhere where:
